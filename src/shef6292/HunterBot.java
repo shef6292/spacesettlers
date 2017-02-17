@@ -1,20 +1,19 @@
 
 package shef6292;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.Stack;
 import java.util.UUID;
 import spacesettlers.actions.AbstractAction;
 import spacesettlers.actions.DoNothingAction;
-import spacesettlers.actions.MoveAction;
-import spacesettlers.actions.MoveToObjectAction;
 import spacesettlers.actions.PurchaseCosts;
 import spacesettlers.actions.PurchaseTypes;
 import spacesettlers.clients.TeamClient;
 import spacesettlers.graphics.CircleGraphics;
+import spacesettlers.graphics.LineGraphics;
 import spacesettlers.graphics.SpacewarGraphics;
 import spacesettlers.objects.AbstractActionableObject;
 import spacesettlers.objects.AbstractObject;
@@ -44,11 +43,26 @@ public class HunterBot extends TeamClient {
         private HashSet<SpacewarGraphics> graphics;
         private AbstractObject target; //This is what we are aiming for
         private boolean clearedToFire; //This is true if we have a target, and it is a target we want to shoot at; it is false if we don't want to shoot
-        private static final int MINIMUM_ENERGY = 750; //A hard minimum on energy reserves, below this level we run for a beacon
+        private static final int MINIMUM_ENERGY = 0; //A hard minimum on energy reserves, below this level we run for a beacon
         private static final int MINIMUM_BASE_ENERGY = 500; //Bases with energy reserves below this value will not be considered  valid locations for refueling
         private int lastShotTime = -100; //The time the last shot was fired, used for calculating whether it has been long enough to fire another shot
         private static final double STEPS_PER_SECOND = 20; //The number of physics steps per second; this is a double to allow for, say, 1 step every 2 seconds, to be represented if necessary
         private static final double CLOSE_RANGE_THRESHOLD = 100; //The distance at which we begin firing at close to the maximum rate
+        private static final double MAX_ENERGY_TO_SEARCH_FACTOR = 7.0/10.0; //We will never search for energy when the ship has more than this proportion of its maximum energy
+        private static final double MISSING_ENERGY_THRESHOLD = 7.0/10.0; //When the ship has more than this proportion of its life MISSING, it will prefer finding energy beacons over hunting ships, given an equivalent distance, and vice versa when the ship has less than that proportion missing
+        private static final double STAND_OFF_DISTANCE = 40; // The distance that we will try and keep between us and our target ship
+        private static final double STAND_OFF_ROTATION = Math.PI/12; //The angle that we try and rotate our angle about the target ship by
+        private static final double KP_ROTATIONAL = 20;     //The constant value that we will set the rotational Kp value to
+        private static final double KV_ROTATIONAL = 12;     //The constant value that we will set the rotational Kv value to
+        private static final double KP_TRANSLATIONAL = 0.2f;  //The constant value that we will set the translational Kp value to
+        private static final double KV_TRANSLATIONAL = 0.894f;  //The constant value that we will set the translational Kv value to
+        private static final int SCALE = 40;    // The scale of the search grid
+        private Stack<Position> plannedPath; // Our planned path
+        private Position currentMoveTarget; // The position that we are presently moving towards
+        private static final int SEARCH_DELAY = 10; // The delay between searches
+        private static final double VELOCITY_CONSTANT = 0.15; //The coefficient of the distance to goal term, for determining the desired velocity at the end of a path leg
+        private static final double DISTANCE_POWER = 0.8; //The power to which we raise the distance to the goal, for determining the desired velocity at the end of a path leg
+        private static final boolean GRAPHICS_ENABLED = true; //Whether we want to be able to view graphical output
         
 	@Override
 	public void initialize(Toroidal2DPhysics space) {
@@ -68,7 +82,7 @@ public class HunterBot extends TeamClient {
             double bestShipDistance = 50000; //Start with an absurdly high distance, so that any other distance should be below it
             Ship bestShip = null; //We don't know what the closest ship is yet
             for(Ship ship:space.getShips()) {
-                if(!ship.getTeamName().equals(myShip.getTeamName())) {
+                if(!ship.getTeamName().equals(myShip.getTeamName()) && ship.isAlive()) {
                     //It is an enemy ship
                     if(bestShip == null) {
                         //This is the first and  thus closest enemy that we've seen
@@ -121,8 +135,11 @@ public class HunterBot extends TeamClient {
                         bestBase = base; //We update the variables accordingly
                         bestBaseDistance = space.findShortestDistance(base.getPosition(), myShip.getPosition());
                     } else{
-                        if(space.findShortestDistance(base.getPosition(), myShip.getPosition()) < bestBaseDistance) {
+                        //Check the distance, weighted by available energy
+                        if((space.findShortestDistance(base.getPosition(), myShip.getPosition())/((double) base.getHealingEnergy())) <
+                                (bestBaseDistance/((double)bestBase.getHealingEnergy()))) {
                             //Closer than the previous closest beacon
+                            //Or has better energy content
                             bestBase = base; //So it is now the new closest beacon
                             bestBaseDistance = space.findShortestDistance(base.getPosition(), myShip.getPosition());
                         }
@@ -198,8 +215,9 @@ public class HunterBot extends TeamClient {
         
         //Returns the delay between shots due to the range
         private int getRangeDelay(double dist, Ship ship) {
-            if(dist < ship.getRadius()*3) {
+            if(dist < ship.getRadius()*2 + Missile.MISSILE_RADIUS*2) {
                 //We are practically on top of them
+                //(Our missiles will spawn inside of them)
                 //Fire at the maximum rate
                 return 1;
             }
@@ -216,35 +234,96 @@ public class HunterBot extends TeamClient {
             }
         }
         
-        private int getSpeedDelay(double dist, Ship ship) {
+        private int getSpeedDelay(double dist, Ship ship, Toroidal2DPhysics space) {
             if(dist < ship.getRadius()*3) {
                 //We are practically on top of them
                 //Fire at the maximum rate
                 return 1;
-            } else {
+            } else /*if(Math.abs(ship.getPosition().getOrientation() - ship.getPosition().getTranslationalVelocity().getAngle()) <= 
+                    Math.atan(((double)2*Missile.MISSILE_RADIUS)/((double)(ship.getRadius() + 2*Missile.MISSILE_RADIUS))))*/{
                 //We want to avoid stacking shots on top of each other
                 //This is so that we won't lose missiles to our own missiles
+                //We slow our rate of fire, because we are pointed closely enought to the direction of travel that this is an issue
                 double seperation = 2*Missile.MISSILE_RADIUS;
-                double floatTime = STEPS_PER_SECOND*(seperation/((double)Missile.INITIAL_VELOCITY - ship.getPosition().getTranslationalVelocity().getMagnitude())); //Converting this seperation to a time, in steps
+                double floatTime = STEPS_PER_SECOND*(seperation/((double)Missile.INITIAL_VELOCITY - 
+                        ship.getPosition().getTranslationalVelocity().dot(space.findShortestDistanceVector(ship.getPosition(), getFiringSolution(target, ship, space)).unit()))); //Converting this seperation to a time, in steps
                 return (int) floatTime + 1; //We round up, to be sure to avoid intercepting our own missiles
+            } /*else {
+                //We aren't pointed in the direction of our velocity
+                //Fire as much as we can
+                return 1;
+            }*/
+        }
+        
+        private void updatePath(Position start, Position goal, Toroidal2DPhysics space) {           
+            //Create a new graph for navigation
+            GridGraph graph = new GridGraph(start, goal, space, SCALE);
+            
+            //Search the graph and get a path
+            A_Star_Search search = new A_Star_Search(graph, graph.getStart(), graph.getGoal());
+            AStarTreeNode[] treePath = search.search();
+            
+            if(treePath != null) {
+                //Empty the stack
+                plannedPath = new Stack<Position>();
+                
+                //Iterate through the path, from the goal
+                for(int i = treePath.length - 1; i >= 0; i--) {
+                    //Extract the position from the node
+                    Position pos = treePath[i].getMyNode().getPosition();
+                    
+                    if(i < treePath.length - 1) {
+                        //Draw a line graphic
+                        SpacewarGraphics graphic = new LineGraphics(treePath[i+1].getMyNode().getPosition(), treePath[i].getMyNode().getPosition(), 
+                                space.findShortestDistanceVector(treePath[i+1].getMyNode().getPosition(), treePath[i].getMyNode().getPosition()));
+                        graphics.add(graphic);
+                        
+                        //Initialize the velocity
+                        //The speed should be proportional to some power of the distance from the goal
+                        Vector2D vec = space.findShortestDistanceVector(pos, 
+                                treePath[i+1].getMyNode().getPosition()).getUnitVector().multiply(VELOCITY_CONSTANT*
+                                        Math.pow(Math.abs(space.findShortestDistance(pos, goal)),
+                                        DISTANCE_POWER));
+                        pos.setTranslationalVelocity(vec);
+                    } else {
+                        pos.setTranslationalVelocity(Vector2D.ZERO_VECTOR);
+                    }
+                    
+                    plannedPath.push(pos);
+                }
+            } else {
+                //No path was found
+                //Continue as previously planned
             }
         }
         
 	@Override
 	public Map<UUID, AbstractAction> getMovementStart(Toroidal2DPhysics space,
 			Set<AbstractActionableObject> actionableObjects) {
+            
+            //Reset the graphics
+            graphics = new HashSet<SpacewarGraphics>();
+            
             //Decide the movement of our ships (and bases, but those don't move)
             HashMap<UUID, AbstractAction> actions = new HashMap<UUID, AbstractAction>();
             for (AbstractObject actionable : actionableObjects) {
                 if(actionable instanceof Ship)  {
                     Ship ship = (Ship) actionable;
                     AbstractAction current = ship.getCurrentAction();
-                    //If we are done with our current movement or if we didn't have a current movement
-                    //Or if we are chasing a dead ship
-                    //Or if we aren't chasing anything
-                    //Then pick a new destination
-                    if(current == null || current.isMovementFinished(space) || target == null || (target instanceof Ship && !target.isAlive())) {
-                        Position newGoal = null;
+                    Position orientTarget = null;
+                    
+                    if(!ship.isAlive()) {
+                        //If out ship is dead, clear the path
+                        plannedPath = new Stack<>();
+                    }
+                    else if(current == null || current.isMovementFinished(space) || (current instanceof MoveAndOrientAction &&
+                            ((MoveAndOrientAction) current).isMovementFinished(ship, space)) || target == null || !target.isAlive() || plannedPath.isEmpty()) {
+                        //If we are done with our current movement or if we didn't have a current movement
+                        //Or if we are chasing a dead ship
+                        //Or if we aren't chasing anything
+                        //Or if our path is empty
+                        //Then pick a new destination
+                        
                         if(ship.getEnergy() < MINIMUM_ENERGY) {
                             //If we are low on energy, find a beacon and head to that
                             target = getNearestEnergyObject(space, ship);
@@ -256,11 +335,11 @@ public class HunterBot extends TeamClient {
                             //But if there is nearby energy, take the opportunity to grab that instead
                             //But only if we are not topped off (we use 7/10 of max energy, or 3500 energy, as our threshold here)
                             //With certain powerups, it can be higher
-                            if(ship.getEnergy() < 7*(ship.getMaxEnergy()/10)) {
+                            if(ship.getEnergy() < (int)(MAX_ENERGY_TO_SEARCH_FACTOR*((double)ship.getMaxEnergy()))) {
                                 AbstractObject energy = getNearestEnergyObject(space, ship);
                                 //Go to the energy, if the ratio of its distance to the enemy distance is
-                                //less than the ratio of missing energy to maximum energy times 4/5
-                                if(space.findShortestDistance(ship.getPosition(), energy.getPosition())*(4.0/5.0)*(
+                                //less than the ratio of maximum energy to missing energy times some constant value
+                                if(space.findShortestDistance(ship.getPosition(), energy.getPosition())*MISSING_ENERGY_THRESHOLD*(
                                         ship.getMaxEnergy()/(ship.getMaxEnergy() - ship.getEnergy())) <
                                         space.findShortestDistance(ship.getPosition(), target.getPosition())) {
                                     target = energy; //Go get the beacon
@@ -269,25 +348,76 @@ public class HunterBot extends TeamClient {
                             }
                             //If the target is still something that we want to calculate a firing solution for, do so
                             if(!(target instanceof Beacon || target instanceof Base)){
-                                newGoal = getFiringSolution(target, ship, space);
+                                orientTarget = getFiringSolution(target, ship, space);
                             }
                         }
-                        MoveAction charge; //Move towards our destination
-                        if(target != null && !target.isMoveable()) { //If we have a target, and it won't move, use a MoveToObjectAction
-                            charge = new MoveToObjectAction(space, ship.getPosition(), target);
+                        
+                        
+                        Position translateTarget; //The position that we want to move to
+                        if(target != null && !target.isMoveable()) {
+                            //If we have a target, and it won't move, move to it
+                            translateTarget = target.getPosition();
+                            orientTarget = target.getPosition();
                         }
-                        else if(newGoal != null) { //Otherwise, move towards the spot that we know we need to shoot at
-                            charge = new MoveAction(space, ship.getPosition(), newGoal); 
-                        } else { //If we haven't got someplace to go, do nothing
-                            charge = new MoveAction(space, ship.getPosition(), ship.getPosition());
+                        else if(orientTarget != null) { 
+                            //Otherwise, move towards them
+                            //We want to keep a stand off distance
+                            //So move to someplace not directly on top of them
+                            Vector2D relativePosition = space.findShortestDistanceVector(ship.getPosition(), target.getPosition());
+                            Vector2D unitRelativePosition = relativePosition.getUnitVector();
+                            
+                            //Take the target's position, and move it some distance towards our ship
+                            //And rotate it, so we won't sit still
+                            Vector2D targetVector = new Vector2D(target.getPosition().getX(), target.getPosition().getY());
+                            Vector2D shiftVector = unitRelativePosition.multiply(STAND_OFF_DISTANCE).rotate(STAND_OFF_ROTATION);
+                            translateTarget = new Position(targetVector.subtract(shiftVector));
+                        } else { 
+                            //If we haven't got someplace to go, do nothing
+                            translateTarget = ship.getPosition();
+                            orientTarget = translateTarget;
                         }
-                        charge.setKpRotational(20); //We want to turn more quickly, for more accurate shooting
-                        charge.setKvRotational(12);  //To maintain critical damping, but tweaked upwards to allow for distortion from the discrete time steps
-                        charge.setKpTranslational(0.2f); //We want to move more quickly, as well
-                        charge.setKvTranslational(0.894f); //And we want to maintain translational critical damping
-                        actions.put(ship.getId(), charge); //put the movement in our movement set
-                        SpacewarGraphics graphic = new CircleGraphics(1, getTeamColor(), newGoal); //Add a circle at our destination
-                        graphics.add(graphic);
+                        
+                        //Update the path if
+                        //It is empty
+                        //Or if enough time has elapsed
+                        //Or if we have drifted far from our interim destination
+                        //Also, let the movement execution know that the path has been updated
+                        boolean updated = false;
+                        if(plannedPath == null || (plannedPath.isEmpty() && (!(space.findShortestDistance(ship.getPosition(), translateTarget) <= 2*SCALE) ||
+                                !(current instanceof MoveAndOrientAction))) || space.getCurrentTimestep()% SEARCH_DELAY == 0 || 
+                                space.findShortestDistance(ship.getPosition(), currentMoveTarget) >= SCALE*3) {
+                            updatePath(ship.getPosition(), translateTarget, space);
+                            updated = true;
+                        }
+                        
+                        if(orientTarget != null) {
+                            SpacewarGraphics graphic = new CircleGraphics(1, getTeamColor(), orientTarget); //Add a circle at our destination
+                            graphics.add(graphic);
+                        }
+                        
+                        //Execute the movement
+                        MoveAndOrientAction charge = null; //Move towards our destination
+                        if(!plannedPath.isEmpty() && (current == null || (current instanceof MoveAndOrientAction && 
+                                ((MoveAndOrientAction)current).isMovementFinished(ship, space)) || updated)) {
+                            currentMoveTarget = plannedPath.pop();
+                            SpacewarGraphics graphic = new CircleGraphics(1, getTeamColor(), currentMoveTarget); //Add a circle at our subdestination
+                            graphics.add(graphic);
+                            charge = new MoveAndOrientAction(space, ship.getPosition(), currentMoveTarget, orientTarget, currentMoveTarget.getTranslationalVelocity());
+                        } else if (!(current instanceof MoveAndOrientAction)){
+                            SpacewarGraphics graphic = new CircleGraphics(1, getTeamColor(), currentMoveTarget); //Add a circle at our subdestination
+                            graphics.add(graphic);
+                            charge = new MoveAndOrientAction(space, ship.getPosition(), currentMoveTarget, orientTarget, currentMoveTarget.getTranslationalVelocity());
+                        } else {
+                            //Do nothing
+                        }
+                        if(charge != null) {
+                            charge.setKpRotational(KP_ROTATIONAL); //We want to turn more quickly, for more accurate shooting
+                            charge.setKvRotational(KV_ROTATIONAL);  //To maintain critical damping, but tweaked upwards to allow for distortion from the discrete time steps
+                            charge.setKpTranslational(KP_TRANSLATIONAL); //We want to move more quickly, as well
+                            charge.setKvTranslational(KV_TRANSLATIONAL); //And we want to maintain translational critical damping
+
+                            actions.put(ship.getId(), charge); //put the movement in our movement set
+                        }
                     }
                 } else {
                     actions.put(actionable.getId(), new DoNothingAction()); //If it isn't a ship, it cannot do anything
@@ -304,8 +434,11 @@ public class HunterBot extends TeamClient {
 
 	@Override
 	public Set<SpacewarGraphics> getGraphics() {
-		// TODO Auto-generated method stub
-		return null;
+            if(graphics.isEmpty() && GRAPHICS_ENABLED) {
+                return null;
+            } else {
+                return graphics;
+            }
 	}
 
 
@@ -347,7 +480,7 @@ public class HunterBot extends TeamClient {
                     //If we have permission to shoot
                     //and if we have a target
                     //and if the target is alive
-                    //and if the target is in one of our range bands, and the timing is right to shoot
+                    //and if the timing is right to shoot
                     //and if we are actually pointed someplace where the shot should hit it
                     //and if there is actually a path clear of asteroids from the ship to the spot 
                     //and if we aren't going to shoot ourselves (i.e., by running over our missiles)
@@ -356,7 +489,7 @@ public class HunterBot extends TeamClient {
                     //Note: the last condition will apply even if the target ship would have collected the asteroids in question before 
                     //      the time of intercept
                     if(clearedToFire && target != null && target.isAlive() && (space.getCurrentTimestep() - lastShotTime) >= getRangeDelay(distance, ship) &&
-                            (space.getCurrentTimestep() - lastShotTime) >= getSpeedDelay(distance, ship) && ship.getPosition().getTotalTranslationalVelocity() < Missile.INITIAL_VELOCITY &&
+                            (space.getCurrentTimestep() - lastShotTime) >= getSpeedDelay(distance, ship, space) && ship.getPosition().getTotalTranslationalVelocity() < Missile.INITIAL_VELOCITY &&
                             Math.abs(ship.getPosition().getOrientation() - 
                                     space.findShortestDistanceVector(ship.getPosition(), getFiringSolution(target, ship, space)).getAngle()) <=
                             Math.atan(Ship.SHIP_RADIUS/distance) &&

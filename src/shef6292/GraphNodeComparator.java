@@ -9,7 +9,6 @@ public class GraphNodeComparator implements Comparator<AStarTreeNode> {
 	
 	public GraphNodeComparator(A_Star_Search aStarSearch, GridGraph graph) {
 		_aStarSearch = aStarSearch;
-//		_nextNode = nextNode;
 		_graph = graph;
 	}
 
@@ -26,12 +25,12 @@ public class GraphNodeComparator implements Comparator<AStarTreeNode> {
 		// move up in priority.
 		if (child1.getDistToGoal() + treeNode1.getPathCost() <
 				child2.getDistToGoal() + treeNode2.getPathCost()) {
-			return 1;
+			return -1;
 		// If child2's f(n) value [f(n)=g(n)+h(n)] is less than child1's, child2 will
 		// move up in priority.
 		} else if (child1.getDistToGoal() + treeNode1.getPathCost() >
 				child2.getDistToGoal() + treeNode2.getPathCost()) {
-			return -1;
+			return 1;
 		}
 		// They have the same f(n) value, so do no sorting.
 		return 0;

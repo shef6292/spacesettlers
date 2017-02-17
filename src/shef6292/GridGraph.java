@@ -2,6 +2,8 @@ package shef6292;
 import java.util.HashSet;
 import java.util.Set;
 import spacesettlers.objects.AbstractObject;
+import spacesettlers.objects.Asteroid;
+import spacesettlers.objects.Base;
 import spacesettlers.objects.Ship;
 import spacesettlers.simulator.Toroidal2DPhysics;
 import spacesettlers.utilities.Position;
@@ -12,11 +14,31 @@ public class GridGraph {
     int HEIGHT; //How high the space is, in nodes
     int SCALE; //The seperation between adjacent nodes
     static final double ROOT2 = 1.4142136; //The square root of 2, to avoid recalculation
+    static final int FREE_RADIUS = 2*Ship.SHIP_RADIUS;
     double[][] adjacency; //The adjacency matrix of the graph
     
     // Scale should divide both the width and the height of the space
     public GridGraph (Position start, Position goal, Toroidal2DPhysics space, int scale) {
-        Set<AbstractObject> allObjects = space.getAllObjects(); //So we can path around them
+        //Path around bases and asteroids
+        Set<Base> bases = space.getBases();
+        Set<Asteroid> asteroids = space.getAsteroids();
+        Set<AbstractObject> avoidObjects = new HashSet<AbstractObject>((Set) asteroids);
+        avoidObjects.addAll((Set) bases);
+        
+        //Unless we are trying to get to the base
+        for(AbstractObject obj : bases) {
+            if(obj.getPosition().equalsLocationOnly(goal)) {
+                avoidObjects.remove(obj);
+            }
+        }
+        
+        //Or if the asteroid is harmless
+        for(AbstractObject obj : asteroids) {
+            if((obj instanceof Asteroid) &&((Asteroid)obj).isMineable()) {
+                avoidObjects.remove(obj);
+            }
+        }
+        
         int width = space.getWidth();   //The width of the environment
         int height = space.getHeight(); //The height of the environment
         WIDTH = (width/scale) - 1; // The number of graph nodes wide we want the environment to be
@@ -33,7 +55,11 @@ public class GridGraph {
         }
         myNodes[myNodes.length-2] = new GraphNode(start); //Add the start and goal to the end of the array
         myNodes[myNodes.length-1] = new GraphNode(goal);
+        
+        
         //Assign adjaceny values
+        //Initialize the matrix
+        adjacency = new double[myNodes.length][myNodes.length];
         for(int i = 0; i < myNodes.length -2; i++) {
             int x = getCol(myNodes[i]);
             int y = getRow(myNodes[i]);
@@ -44,7 +70,7 @@ public class GridGraph {
                     continue;
                 }
                 if(offByOne(x, y, getCol(myNodes[j]), getRow(myNodes[j]))) {
-                    if(space.isPathClearOfObstructions(myNodes[i].getPosition(), myNodes[j].getPosition(), allObjects, Ship.SHIP_RADIUS)) {
+                    if(space.isPathClearOfObstructions(myNodes[i].getPosition(), myNodes[j].getPosition(), avoidObjects, FREE_RADIUS)) {
                         if(x == getCol(myNodes[j]) || y == getRow(myNodes[j])) {
                             //The nodes are adjacent orthogonally
                             adjacency[i][j] = SCALE;
@@ -63,7 +89,7 @@ public class GridGraph {
             }
             //If the start node is in a square with myNodes[i] as a corner
             //Add an edge between them
-            if(inBox(myNodes[i], getStart()) && space.isPathClearOfObstructions(myNodes[i].getPosition(), start, allObjects, Ship.SHIP_RADIUS)) {
+            if(inBox(myNodes[i], getStart()) && space.isPathClearOfObstructions(myNodes[i].getPosition(), start, avoidObjects, FREE_RADIUS)) {
                 //The start  node is adjacent to myNodes[i], so mark a connection in the adjacency matrix
                 adjacency[i][myNodes.length - 2] = space.findShortestDistance(myNodes[i].getPosition(), start);
                 adjacency[myNodes.length - 2][i] = space.findShortestDistance(myNodes[i].getPosition(), start);
@@ -72,7 +98,7 @@ public class GridGraph {
                 adjacency[i][myNodes.length - 2] = -1;
                 adjacency[myNodes.length - 2][i] = -1;
             }
-            if(inBox(myNodes[i], getGoal()) && space.isPathClearOfObstructions(myNodes[i].getPosition(), goal, allObjects, Ship.SHIP_RADIUS)) {
+            if(inBox(myNodes[i], getGoal()) && space.isPathClearOfObstructions(myNodes[i].getPosition(), goal, avoidObjects, FREE_RADIUS)) {
                 adjacency[i][myNodes.length - 1] = space.findShortestDistance(myNodes[i].getPosition(), goal);
                 adjacency[myNodes.length - 1][i] = space.findShortestDistance(myNodes[i].getPosition(), goal);
             } else {
@@ -84,7 +110,7 @@ public class GridGraph {
         }
         adjacency[myNodes.length-2][myNodes.length-2] = 0; //The start is adjacent to itself
         adjacency[myNodes.length-1][myNodes.length-1] = 0; //The goal is adjacent to itself
-        if(space.findShortestDistance(start, goal) < 2*SCALE && space.isPathClearOfObstructions(start, goal, allObjects, Ship.SHIP_RADIUS)) {
+        if(space.findShortestDistance(start, goal) < 2*SCALE && space.isPathClearOfObstructions(start, goal, avoidObjects, FREE_RADIUS)) {
             //If the start and goal are adjacent
             //Mark them as such
             adjacency[myNodes.length-1][myNodes.length-2] = space.findShortestDistance(start, goal);
